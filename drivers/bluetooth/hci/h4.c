@@ -56,6 +56,14 @@ struct h4_data {
 		bool            have_hdr;
 		bool            discardable;
 
+		/* The ISR may process received bytes (clear while rx_thread
+		 * owns rx). Changed only together with the RX interrupt
+		 * enable, under lock: while clear, the RX interrupt is
+		 * disabled.
+		 */
+		atomic_t isr_rx;
+		struct k_spinlock lock;
+
 		uint8_t         hdr_len;
 
 		uint8_t         type;
@@ -256,10 +264,41 @@ static bool vnd_consumed(struct h4_data *h4, struct net_buf *buf)
 }
 #endif
 
+/* Hand the RX state to the ISR. The lock keeps the ISR out between the
+ * two steps: an ISR that defers its allocation there would disable the
+ * RX interrupt and clear the flag, and the enable would then leave an RX
+ * interrupt pending that the ISR ignores and never clears.
+ */
+static void rx_isr_enable(const struct device *dev)
+{
+	const struct h4_config *cfg = dev->config;
+	struct h4_data *h4 = dev->data;
+	k_spinlock_key_t key = k_spin_lock(&h4->rx.lock);
+
+	atomic_set(&h4->rx.isr_rx, 1);
+	uart_irq_rx_enable(cfg->uart);
+	k_spin_unlock(&h4->rx.lock, key);
+}
+
+/* Take the RX state from the ISR (also called by the ISR when it defers
+ * its allocation). Disabling the RX interrupt is not enough: a TX
+ * interrupt runs the same ISR, and uart_irq_rx_ready() may report
+ * received bytes while the RX interrupt is disabled.
+ */
+static void rx_isr_disable(const struct device *dev)
+{
+	const struct h4_config *cfg = dev->config;
+	struct h4_data *h4 = dev->data;
+	k_spinlock_key_t key = k_spin_lock(&h4->rx.lock);
+
+	uart_irq_rx_disable(cfg->uart);
+	atomic_set(&h4->rx.isr_rx, 0);
+	k_spin_unlock(&h4->rx.lock, key);
+}
+
 static void rx_thread(void *p1, void *p2, void *p3)
 {
 	const struct device *dev = p1;
-	const struct h4_config *cfg = dev->config;
 	struct h4_data *h4 = dev->data;
 	struct net_buf *buf;
 
@@ -270,6 +309,11 @@ static void rx_thread(void *p1, void *p2, void *p3)
 
 	while (1) {
 		LOG_DBG("rx.buf %p", h4->rx.buf);
+
+		/* The semaphore may wake us with the RX interrupt still
+		 * enabled; the ISR must not touch rx while we allocate.
+		 */
+		rx_isr_disable(dev);
 
 		/* We can only do the allocation if we know the initial
 		 * header, since Command Complete/Status events must use the
@@ -288,13 +332,13 @@ static void rx_thread(void *p1, void *p2, void *p3)
 		}
 
 		/* Let the ISR continue receiving new packets */
-		uart_irq_rx_enable(cfg->uart);
+		rx_isr_enable(dev);
 
 		k_sem_take(&h4->rx.ready, K_FOREVER);
 
 		buf = k_fifo_get(&h4->rx.fifo, K_NO_WAIT);
 		while (buf != NULL) {
-			uart_irq_rx_enable(cfg->uart);
+			rx_isr_enable(dev);
 
 			if (vnd_consumed(h4, buf)) {
 				net_buf_unref(buf);
@@ -309,7 +353,7 @@ static void rx_thread(void *p1, void *p2, void *p3)
 			 */
 			k_yield();
 
-			uart_irq_rx_disable(cfg->uart);
+			rx_isr_disable(dev);
 			buf = k_fifo_get(&h4->rx.fifo, K_NO_WAIT);
 		}
 	}
@@ -349,7 +393,7 @@ static inline void read_payload(const struct device *dev)
 			}
 
 			LOG_WRN("Failed to allocate, deferring to rx_thread");
-			uart_irq_rx_disable(cfg->uart);
+			rx_isr_disable(dev);
 			/*
 			 * At this time, HCI UART RX is turned off, which means that no new
 			 * received data buffer will be put into the RX FIFO. This will cause
@@ -500,6 +544,7 @@ static inline void process_rx(const struct device *dev)
 static void bt_uart_isr(const struct device *uart, void *user_data)
 {
 	struct device *dev = user_data;
+	struct h4_data *h4 = dev->data;
 
 	while (true) {
 		uart_irq_update(uart);
@@ -512,7 +557,7 @@ static void bt_uart_isr(const struct device *uart, void *user_data)
 			process_tx(dev);
 		}
 
-		if (uart_irq_rx_ready(uart)) {
+		if (atomic_get(&h4->rx.isr_rx) && uart_irq_rx_ready(uart)) {
 			process_rx(dev);
 		}
 	}
@@ -566,7 +611,7 @@ static void h4_stop(const struct device *dev)
 	struct h4_data *h4 = dev->data;
 	struct net_buf *buf;
 
-	uart_irq_rx_disable(cfg->uart);
+	rx_isr_disable(dev);
 	uart_irq_tx_disable(cfg->uart);
 
 	k_thread_abort(cfg->rx_thread);
