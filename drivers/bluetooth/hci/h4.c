@@ -278,7 +278,7 @@ static void rx_thread(void *p1, void *p2, void *p3)
 		if (h4->rx.have_hdr && !h4->rx.buf) {
 			h4->rx.buf = get_rx(h4, K_FOREVER);
 			LOG_DBG("Got rx.buf %p", h4->rx.buf);
-			if (h4->rx.remaining > net_buf_tailroom(h4->rx.buf)) {
+			if (h4->rx.remaining + h4->rx.hdr_len > net_buf_tailroom(h4->rx.buf)) {
 				LOG_ERR("Not enough space in buffer");
 				h4->rx.discard = h4->rx.remaining;
 				reset_rx(h4);
@@ -432,7 +432,7 @@ static inline void read_header(const struct device *dev)
 	}
 
 	if (h4->rx.have_hdr && h4->rx.buf) {
-		if (h4->rx.remaining > net_buf_tailroom(h4->rx.buf)) {
+		if (h4->rx.remaining + h4->rx.hdr_len > net_buf_tailroom(h4->rx.buf)) {
 			LOG_ERR("Not enough space in buffer");
 			h4->rx.discard = h4->rx.remaining;
 			reset_rx(h4);
