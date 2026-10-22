@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Interrupt-driven UART of the H:4 driver test (tests/bluetooth/hci_h4):
+  received bytes are injected by the test, and uart_irq_rx_ready() reports
+  waiting bytes whether or not the RX interrupt is enabled.
+
+compatible: "vnd,h4-test-uart"
+
+include: uart-controller.yaml
